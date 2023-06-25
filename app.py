@@ -3,23 +3,12 @@ import time
 import socket
 import threading
 import json
-import logging
+import random
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.exceptions import InvalidSignature
-
-
-# Constants
-HOST = "localhost"
-PORT = 5000
-# PEERS = [("localhost", 5001), ("localhost", 5002)]
-BOOTSTRAP_NODES = [("localhost", 5001), ("localhost", 5002)]
-
-# Logger configuration
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 
 def public_key_to_bytes(public_key):
@@ -55,12 +44,12 @@ class Block:
         )
         return hashlib.sha256(hash_data.encode()).hexdigest()
 
-    def mine_block(self, difficulty):
+    def mine_block(self, difficulty):  # Proof of Work
         target = "0" * difficulty
-        while not self.hash.startswith(target):
+        while self.hash[:difficulty] != target:
             self.nonce += 1
             self.hash = self.calculate_hash()
-        logger.info("Block mined: %s", self.hash)
+        print("Block mined:", self.hash)
 
     def to_dict(self):
         return {
@@ -77,7 +66,7 @@ class Block:
         block = cls(
             data["index"],
             data["timestamp"],
-            [Transaction.from_dict(tx) for tx in data["transactions"]],
+            [Transaction.from_dict(tx_data) for tx_data in data["transactions"]],
             data["previous_hash"],
         )
         block.nonce = data["nonce"]
@@ -120,30 +109,30 @@ class Transaction:
 
     def to_dict(self):
         return {
-            "sender": self.sender,
-            "recipient": self.recipient,
+            "sender": self.sender.decode(),
+            "recipient": self.recipient.decode(),
             "amount": self.amount,
-            "signature": self.signature,
+            "signature": self.signature.hex(),  # Convert bytes to hexadecimal string
         }
 
     @classmethod
     def from_dict(cls, data):
-        return cls(
-            data["sender"],
-            data["recipient"],
-            data["amount"],
-            data["signature"],
-        )
+        sender = data["sender"].encode()
+        recipient = data["recipient"].encode()
+        amount = data["amount"]
+        signature = bytes.fromhex(
+            data["signature"]
+        )  # Convert hexadecimal string to bytes
+        return cls(sender, recipient, amount, signature)
 
 
 class Blockchain:
     def __init__(self):
         self.chain = [self.create_genesis_block()]
-        self.difficulty = 5
+        self.difficulty = 4
         self.pending_transactions = []
         self.voters = set()
         self.candidates = {}
-        self.lock = threading.Lock()
 
     def create_genesis_block(self):
         return Block(0, time.time(), [], "0")
@@ -156,16 +145,16 @@ class Blockchain:
         self.pending_transactions.append(transaction)
 
     def mine_pending_transactions(self):
-        if len(self.pending_transactions) > 0:
-            block = Block(
-                len(self.chain),
-                time.time(),
-                self.pending_transactions,
-                self.latest_block.hash,
-            )
-            block.mine_block(self.difficulty)
-            self.chain.append(block)
-            self.pending_transactions = []
+        print("PENDING TRANSACTIONS:", len(self.pending_transactions))
+        block = Block(
+            len(self.chain),
+            time.time(),
+            self.pending_transactions,
+            self.latest_block.hash,
+        )
+        block.mine_block(self.difficulty)
+        self.chain.append(block)
+        self.pending_transactions = []
 
     def get_balance(self, address):
         balance = 0
@@ -181,255 +170,322 @@ class Blockchain:
         for i in range(1, len(self.chain)):
             current_block = self.chain[i]
             previous_block = self.chain[i - 1]
-
             if current_block.hash != current_block.calculate_hash():
                 return False
-
             if current_block.previous_hash != previous_block.hash:
                 return False
-
         return True
 
-    def register_voter(self, public_key):
-        self.voters.add(public_key_to_bytes(public_key))
+    def register_voter(self, voter_public_key):
+        self.voters.add(voter_public_key)
 
-    def register_candidate(self, public_key, name):
-        self.candidates[public_key_to_bytes(public_key)] = name
+    def authenticate_voter(self, voter_public_key):
+        return voter_public_key in self.voters
 
-    def add_block(self, block):
-        with self.lock:
-            if len(self.chain) > 0:
-                previous_block = self.chain[-1]
-                if block.previous_hash != previous_block.hash:
-                    raise ValueError("Invalid block. Previous hash does not match.")
-            self.chain.append(block)
-            logger.info("Block added to the blockchain.")
+    def register_candidate(self, candidate_public_key):
+        self.candidates[candidate_public_key] = 0
 
-    def to_dict(self):
-        return {
-            "chain": [block.to_dict() for block in self.chain],
-            "difficulty": self.difficulty,
-            "pending_transactions": [tx.to_dict() for tx in self.pending_transactions],
-            "voters": [
-                bytes_to_public_key(v)
-                .public_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
-                )
-                .hex()
-                for v in self.voters
-            ],
-            "candidates": {
-                bytes_to_public_key(k)
-                .public_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
-                )
-                .hex(): v
-                for k, v in self.candidates.items()
-            },
-        }
-
-    @classmethod
-    def from_dict(cls, data):
-        blockchain = cls()
-        blockchain.chain = [Block.from_dict(block_data) for block_data in data["chain"]]
-        blockchain.difficulty = data["difficulty"]
-        blockchain.pending_transactions = [
-            Transaction.from_dict(tx) for tx in data["pending_transactions"]
-        ]
-        blockchain.voters = {bytes.fromhex(v) for v in data["voters"]}
-        blockchain.candidates = {
-            bytes.fromhex(k): v for k, v in data["candidates"].items()
-        }
-        return blockchain
-
-
-class PeerManager:
-    def __init__(self, node, known_peers=None):
-        if known_peers is None:
-            known_peers = []
-        self.node = node
-        self.known_peers = set(known_peers)
-        self.lock = threading.Lock()
-
-    def add_peer(self, peer):
-        with self.lock:
-            self.known_peers.add(peer)
-
-    def remove_peer(self, peer):
-        with self.lock:
-            self.known_peers.remove(peer)
-
-    def get_peers(self):
-        with self.lock:
-            return list(self.known_peers)
-
-    def discover_peers(self):
-        self.bootstrap_discovery()
-        while True:
-            time.sleep(30)  # Adjust the peer discovery interval as needed
-            self.exchange_peers()
-
-    def bootstrap_discovery(self):
-        for bootstrap_node in self.known_peers:
-            self.connect_to_peer(bootstrap_node)
-
-    def exchange_peers(self):
-        peers = self.get_peers()
-        for peer in peers:
-            self.connect_to_peer(peer)
-
-    def connect_to_peer(self, peer):
-        try:
-            peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            print(f"Type: {type(peer)}, Value: {peer}")
-            peer_socket.connect(peer)
-
-            # Ask for the peer's known peers
-            peer_socket.send(json.dumps({"get_peers": True}).encode())
-            response = peer_socket.recv(4096).decode()
-            response = json.loads(response)
-            if "peers" in response:
-                for new_peer in response["peers"]:
-                    self.add_peer(new_peer)
-
-            self.node.handle_peer(peer_socket)
-            peer_socket.close()
-        except ConnectionRefusedError:
-            return
-
-
-class Node:
-    def __init__(self, bootstrap_nodes=None):
-        self.blockchain = Blockchain()
-        self.peer_manager = PeerManager(self, bootstrap_nodes)
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.bind((HOST, PORT))
-
-    def start(self):
-        self.server.listen(10)
-        threading.Thread(target=self.peer_manager.discover_peers).start()
-        threading.Thread(target=self.start_mining).start()
-        while True:
-            client_socket, address = self.server.accept()
-            threading.Thread(
-                target=self.handle_client,
-                args=(client_socket,),
-            ).start()
-
-    def handle_client(self, client_socket):
-        try:
-            request = client_socket.recv(4096).decode()
-            request = json.loads(request)
-
-            if "transaction" in request:
-                self.handle_transaction_request(request)
-            elif "get_balance" in request:
-                self.handle_balance_request(request, client_socket)
-            elif "register_voter" in request:
-                self.handle_voter_registration_request(request)
-            elif "register_candidate" in request:
-                self.handle_candidate_registration_request(request)
-            elif "get_blockchain" in request:
-                self.handle_blockchain_request(client_socket)
-            elif "add_block" in request:
-                self.handle_block_addition_request(request)
-            elif "get_peers" in request:
-                self.handle_peer_request(client_socket)
-
-        except json.JSONDecodeError:
-            logger.error("Invalid request format.")
-        except ValueError as e:
-            logger.error(str(e))
-        except ConnectionResetError:
-            logger.error("Connection with client closed abruptly.")
-
-        client_socket.close()
-
-    def handle_transaction_request(self, request):
-        transaction_data = request["transaction"]
-        transaction = Transaction.from_dict(transaction_data)
-        public_key = bytes_to_public_key(bytes.fromhex(transaction_data["sender"]))
-
-        if transaction.verify_transaction(public_key):
-            self.blockchain.add_transaction(transaction)
-            logger.info("Transaction added to the pending transactions.")
+    def vote_for_candidate(self, sender_wallet, candidate_public_key, amount):
+        transaction = Transaction(
+            sender_wallet.get_public_key_bytes(), candidate_public_key, amount
+        )
+        sender_wallet.sign_transaction(transaction)
+        if transaction.verify_transaction(sender_wallet.public_key):
+            self.add_transaction(transaction)
+            self.candidates[candidate_public_key] += amount
         else:
-            logger.info("Invalid transaction.")
+            print("Failed to validate the transaction.")
 
-    def handle_balance_request(self, request, client_socket):
-        address = request["get_balance"]
-        balance = self.blockchain.get_balance(address)
-        response = json.dumps({"balance": balance})
-        client_socket.send(response.encode())
-
-    def handle_voter_registration_request(self, request):
-        public_key = bytes_to_public_key(bytes.fromhex(request["register_voter"]))
-        self.blockchain.register_voter(public_key)
-        logger.info("Voter registered.")
-
-    def handle_candidate_registration_request(self, request):
-        public_key = bytes_to_public_key(
-            bytes.fromhex(request["register_candidate"]["public_key"])
-        )
-        name = request["register_candidate"]["name"]
-        self.blockchain.register_candidate(public_key, name)
-        logger.info("Candidate registered.")
-
-    def handle_blockchain_request(self, client_socket):
-        response = json.dumps(
-            {"blockchain": self.blockchain.to_dict()},
-            indent=4,
-        )
-        client_socket.send(response.encode())
-
-    def handle_block_addition_request(self, request):
-        block_data = request["add_block"]
-        block = Block.from_dict(block_data)
-        self.blockchain.add_block(block)
-        logger.info("Block received and added to the blockchain.")
-
-    def handle_peer(self, peer_socket):
-        request = {"get_blockchain": True}
-        peer_socket.send(json.dumps(request).encode())
-        response = peer_socket.recv(4096).decode()
-        response = json.loads(response)
-
-        if "blockchain" in response:
-            received_blockchain = response["blockchain"]
-            if len(received_blockchain) > len(self.blockchain.chain):
-                self.blockchain.chain = received_blockchain
-
-    def start_mining(self):
-        while True:
-            time.sleep(5)  # Adjust the mining interval as needed
-            self.blockchain.mine_pending_transactions()
-            logger.info("Mining completed.")
-
-    def handle_peer_request(self, client_socket):
-        response = json.dumps({"peers": self.peer_manager.get_peers()})
-        client_socket.send(response.encode())
+    def get_candidate_votes(self, candidate_public_key):
+        return self.candidates.get(candidate_public_key, 0)
 
 
 class Wallet:
     def __init__(self):
-        self.private_key = rsa.generate_private_key(
+        self.private_key, self.public_key = self.generate_keys()
+
+    def generate_keys(self):
+        private_key = rsa.generate_private_key(
             public_exponent=65537,
             key_size=2048,
             backend=default_backend(),
         )
-        self.public_key = self.private_key.public_key()
-
-    def get_address(self):
-        address = public_key_to_bytes(self.public_key)
-        return address.hex()
+        public_key = private_key.public_key()
+        return private_key, public_key
 
     def sign_transaction(self, transaction):
         transaction.sign_transaction(self.private_key)
 
+    def get_public_key_bytes(self):
+        return public_key_to_bytes(self.public_key)
+
+
+class Node:
+    def __init__(self, host, port, blockchain):
+        self.host = host
+        self.port = port
+        self.node_id = f"{self.host}:{self.port}"
+        self.blockchain = blockchain
+        self.server = None
+        self.peers = set()
+
+    def start(self):
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.bind((self.host, self.port))
+        self.server.listen(5)
+        print(f"Node {self.node_id} listening on {self.host}:{self.port}")
+        threading.Thread(target=self.accept_connections).start()
+        threading.Thread(target=self.discover_peers).start()
+
+    def accept_connections(self):
+        while True:
+            client_socket, client_address = self.server.accept()
+            threading.Thread(target=self.handle_client, args=(client_socket,)).start()
+            threading.Thread(target=self.handle_peer, args=(client_socket,)).start()
+
+    def handle_client(self, client_socket):
+        request = self.receive_message(client_socket)
+        print("Handle Client")
+        if request:
+            message_type = request["type"]
+            if message_type == "new_transaction":
+                transaction = Transaction(
+                    request["data"]["sender"],
+                    request["data"]["recipient"],
+                    request["data"]["amount"],
+                    request["data"]["signature"],
+                )
+                if transaction.verify_transaction(
+                    bytes_to_public_key(transaction.sender)
+                ):
+                    self.blockchain.add_transaction(transaction)
+                    response = {"type": "transaction_added"}
+                else:
+                    response = {"type": "transaction_invalid"}
+                self.send_message(client_socket, response)
+            elif message_type == "get_balance":
+                balance = self.blockchain.get_balance(request["data"]["address"])
+                response = {"type": "balance_response", "data": {"balance": balance}}
+                self.send_message(client_socket, response)
+            elif message_type == "get_candidate_votes":
+                votes = self.blockchain.get_candidate_votes(
+                    request["data"]["candidate_public_key"]
+                )
+                response = {
+                    "type": "candidate_votes_response",
+                    "data": {"votes": votes},
+                }
+                self.send_message(client_socket, response)
+            elif message_type == "get_blockchain":
+                response = {
+                    "type": "blockchain_response",
+                    "data": {
+                        "blockchain": [
+                            block.to_dict() for block in self.blockchain.chain
+                        ]
+                    },
+                }
+                self.send_message(client_socket, response)
+            else:
+                response = {"type": "error", "message": "Invalid message type"}
+                self.send_message(client_socket, response)
+        client_socket.close()
+
+    def send_message(self, client_socket, message):
+        data = self.serialize_message(message)
+        client_socket.sendall(data)
+
+    def receive_message(self, client_socket):
+        complete_data = b""
+        while True:
+            data = client_socket.recv(4096)
+            if not data:
+                break
+            complete_data += data
+
+            # Check if the complete message has been received
+            if len(complete_data) >= 4:
+                message_length = int.from_bytes(complete_data[:4], "big")
+                if len(complete_data) >= 4 + message_length:
+                    message_data = complete_data[4 : 4 + message_length]
+                    message = self.deserialize_message(message_data)
+                    return message
+
+        return None
+
+    @staticmethod
+    def serialize_message(message):
+        return json.dumps(message).encode()
+
+    @staticmethod
+    def deserialize_message(data):
+        return json.loads(data.decode())
+
+    def connect_to_peer(self, peer_host, peer_port):
+        if (peer_host, peer_port) not in self.peers:
+            try:
+                peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                peer_socket.connect((peer_host, peer_port))
+                self.peers.add((peer_host, peer_port))
+                threading.Thread(target=self.handle_peer, args=(peer_socket,)).start()
+                print(f"Connected to peer {peer_host}:{peer_port}")
+                self.send_message(peer_socket, {"type": "get_blockchain"})
+            except ConnectionRefusedError:
+                print(f"Connection to peer {peer_host}:{peer_port} refused")
+
+    def handle_peer(self, peer_socket):
+        request = self.receive_message(peer_socket)
+        print("HANDLE PEER")
+        if request:
+            message_type = request["type"]
+            if message_type == "get_peers":
+                response = {
+                    "type": "peers_response",
+                    "data": {"peers": list(self.peers)},
+                }
+                self.send_message(peer_socket, response)
+            elif message_type == "add_peer":
+                peer_host = request["data"]["host"]
+                peer_port = request["data"]["port"]
+                self.connect_to_peer(peer_host, peer_port)
+            elif message_type == "blockchain_response":
+                received_blockchain = request["data"]["blockchain"]
+                if len(received_blockchain) > len(self.blockchain.chain):
+                    self.blockchain.chain = [
+                        Block.from_dict(block_data)
+                        for block_data in received_blockchain
+                    ]
+                    print("Updated blockchain received from peer")
+            elif message_type == "new_block":
+                block_data = request["data"]
+                block = Block.from_dict(block_data)
+                if block.index == self.blockchain.latest_block.index + 1:
+                    self.blockchain.chain.append(block)
+                    print("New block added to the blockchain")
+                else:
+                    print("Received block has incorrect index")
+            else:
+                response = {"type": "error", "message": "Invalid message type"}
+                self.send_message(peer_socket, response)
+        peer_socket.close()
+
+    def broadcast_message(self, message):
+        for peer_host, peer_port in self.peers:
+            print(self.host, self.port, "Broadcasted to:", peer_host, peer_port)
+            try:
+                peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                peer_socket.connect((peer_host, peer_port))
+                self.send_message(peer_socket, message)
+                peer_socket.close()
+            except ConnectionRefusedError:
+                print(f"Connection to peer {peer_host}:{peer_port} refused")
+
+    def start_mining(self, difficulty):
+        while True:
+            self.blockchain.mine_pending_transactions()
+            block = self.blockchain.latest_block
+            message = {"type": "new_block", "data": block.to_dict()}
+            self.broadcast_message(message)
+            time.sleep(5)  # Mine a new block every 10 seconds
+
+    def discover_peers(self):
+        while True:
+            for peer_host, peer_port in self.peers.copy():
+                try:
+                    peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    peer_socket.connect((peer_host, peer_port))
+                    self.send_message(peer_socket, {"type": "get_peers"})
+                    response = self.receive_message(peer_socket)
+                    if response and response["type"] == "peers_response":
+                        new_peers = response["data"]["peers"]
+                        for new_peer in new_peers:
+                            if (
+                                new_peer != (self.host, self.port)
+                                and new_peer not in self.peers
+                            ):
+                                self.peers.add(new_peer)
+                                self.send_message(
+                                    peer_socket,
+                                    {
+                                        "type": "add_peer",
+                                        "data": {"host": self.host, "port": self.port},
+                                    },
+                                )
+                    peer_socket.close()
+                except ConnectionRefusedError:
+                    print(f"Connection to peer {peer_host}:{peer_port} refused")
+            time.sleep(30)  # Discover peers every 30 seconds
+
+
+def main():
+    # Create a blockchain instance
+    blockchain = Blockchain()
+
+    # Create a node and start it
+    node = Node("localhost", 5000, blockchain)
+    node.start()
+
+    # Create a node and start it
+    Bootstrap5001 = Node("localhost", 5001, blockchain)
+    Bootstrap5001.start()
+
+    # Create a node and start it
+    Bootstrap5002 = Node("localhost", 5002, blockchain)
+    Bootstrap5002.start()
+
+    # Connect to peers
+    node.connect_to_peer("localhost", 5001)
+    node.connect_to_peer("localhost", 5002)
+
+    # Start mining thread
+    threading.Thread(target=node.start_mining, args=(blockchain.difficulty,)).start()
+    # threading.Thread(
+    #     target=Bootstrap5001.start_mining, args=(blockchain.difficulty,)
+    # ).start()
+    # threading.Thread(
+    #     target=Bootstrap5002.start_mining, args=(blockchain.difficulty,)
+    # ).start()
+
+    # Create candidates
+    candidate1 = Wallet()
+    candidate2 = Wallet()
+
+    # Register candidates
+    blockchain.register_candidate(candidate1.get_public_key_bytes())
+    blockchain.register_candidate(candidate2.get_public_key_bytes())
+
+    # Get the list of candidate public keys
+    candidate_public_keys = list(blockchain.candidates.keys())
+
+    # Wait for mining thread to complete
+    while True:
+        # Create a list to store voters
+        voters = []
+
+        # Create voters and register them
+        for _ in range(random.randint(1, 10)):
+            voter = Wallet()
+            voters.append(voter)
+            blockchain.register_voter(voter.get_public_key_bytes())
+
+        # Vote for candidates randomly
+        for voter in voters:
+            candidate_public_key = random.choice(candidate_public_keys)
+            amount = 1
+            blockchain.vote_for_candidate(voter, candidate_public_key, amount)
+
+        # Print candidate votes
+        print(
+            "Candidate 1 Votes:",
+            blockchain.get_candidate_votes(candidate1.get_public_key_bytes()),
+        )
+        print(
+            "Candidate 2 Votes:",
+            blockchain.get_candidate_votes(candidate2.get_public_key_bytes()),
+        )
+        print("Is the chain valid:", blockchain.is_chain_valid())
+        time.sleep(3)
+
 
 if __name__ == "__main__":
-    bootstrap_nodes = BOOTSTRAP_NODES
-    node = Node(bootstrap_nodes)
-    node.start()
+    main()
